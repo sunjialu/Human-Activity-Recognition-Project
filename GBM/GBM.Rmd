@@ -1,0 +1,336 @@
+---
+title: "E6690 HW1"
+# header-includes:
+#    - \setlength\parindent{20pt}
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+This file contains the how we train the GBM model for the prediction of human behavior. 
+We use h2o package which can speedup the training process by exploiting the parallelism in PC.
+The brief procedure in training this model: 
+  load the datasets;
+  do the data preprocessing;
+  demension reduction using PCA and do some data visualization;
+  train the GBM model using the feature extracted data;
+  test the model to see the accuracy.
+
+
+At the end of the file, we also attached how to do the grid search to find the best parameters to train the model in HAR problem setting.
+
+
+
+```{r}
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(h2o))
+suppressPackageStartupMessages(library(plotly))
+
+# Start and connect to a H2O cluster (JVM)
+h2o.init(nthreads = -1)
+```
+
+
+
+```{r}
+# Import datasets
+hex_train <- h2o.importFile("./dataset/train.csv.gz")
+hex_test <- h2o.importFile("./dataset/test.csv.gz")
+```
+
+
+
+
+```{r}
+# Extract 'activity' columns for other graphics packages in R
+d_activity_train <- as.data.frame(hex_train$activity)
+d_activity_test <- as.data.frame(hex_test$activity)
+# Count acitivity 
+d_freq_train <- as.data.frame(table(d_activity_train))
+d_freq_test <- as.data.frame(table(d_activity_test))
+d_freq <- merge(d_freq_train, d_freq_test, by.x = "d_activity_train", by.y = "d_activity_test", sort = FALSE)
+colnames(d_freq) <- c("activity", "freq_train", "freq_test")
+d_freq
+
+```
+
+
+
+```{r}
+# Principal Component Analysis
+# 95% of variance in original data captured by first five principal components
+model_pca <- h2o.prcomp(training_frame = hex_train, 
+                    x = 2:562, 
+                    model_id = "h2o_pca",
+                    k = 5)
+model_pca    
+```
+
+
+
+
+```{r}
+# Visualize principle components with activity labels
+d_pca <- as.data.frame(h2o.predict(model_pca, hex_train))
+d_pca <- data.frame(d_pca, as.data.frame(hex_train$activity))
+p <- plot_ly(data = d_pca, x = ~PC1, y = ~PC2, z = ~PC3, color = ~activity) %>%
+  add_markers() %>%
+  layout(scene = list(xaxis = list(title = 'PC1'),
+                     yaxis = list(title = 'PC2'),
+                     zaxis = list(title = 'PC3')))
+p
+```
+
+
+
+
+```{r}
+
+p <- plot_ly(data = d_pca, x = ~PC1, y = ~PC2, color = ~activity, 
+             type = "scatter", mode = "markers", marker = list(size = 3)) %>%
+     layout(title = "Visualizing Principle Components")
+p
+# export(p, 'HAR_pca_pc2&3.png')
+```
+
+
+
+Step 4 - Build and evalutate a predictive model using H2O’s Gradient Boosting Machine (GBM) algorithm
+
+```{r}
+# Define target and features for model training
+target <- "activity"
+features <- setdiff(colnames(hex_train), target) # i.e. using the records of all 561 sensors
+```
+
+```{r}
+# Build a GBM model with cross-validation and early stopping
+model <- h2o.gbm(x = features,
+                 y = target,
+                 training_frame = hex_train,                 
+                 model_id = "h2o_gbm",
+                 ntrees = 500,
+                 learn_rate = 0.05,
+                 learn_rate_annealing = 0.999,
+                 max_depth = 22,
+                 sample_rate = 0.64,
+                 col_sample_rate = 0.5,
+                 nfolds = 7,
+                 fold_assignment = "Stratified",
+                 histogram_type = "RoundRobin",
+                 stopping_metric = "logloss",
+                 stopping_rounds = 5,
+                 score_tree_interval = 10,
+                 seed = 1234)
+
+# Print out model summary
+model
+```
+
+
+```{r}
+# Visualize variable importance
+h2o.varimp_plot(model, num_of_features = 15)
+```
+
+```{r}
+# Make predictions
+yhat_test <- h2o.predict(model, hex_test)
+head(yhat_test)
+```
+
+```{r}
+# Evaluate predictions
+h2o.performance <- h2o.performance(model, newdata = hex_test)
+h2o.performance
+```
+
+
+
+## Search for hyper-parameter
+
+```{r}
+# search for maxdepth
+hyper_params = list( max_depth = seq(1,29,2) )
+grid <- h2o.grid(
+  ## hyper parameters
+  hyper_params = hyper_params,
+  
+  ## full Cartesian hyper-parameter search
+  search_criteria = list(strategy = "Cartesian"),
+  
+  ## which algorithm to run
+  algorithm="gbm",
+  
+  ## identifier for the grid, to later retrieve it
+  grid_id="depth_grid",
+  
+  ## standard model parameters
+  x = features, 
+  y = target, 
+  training_frame = hex_train[1:1000,], 
+  
+  ## more trees is better if the learning rate is small enough 
+  ## here, use "more than enough" trees - we have early stopping
+  ntrees = 1000,                                                            
+  
+  ## smaller learning rate is better
+  ## since we have learning_rate_annealing, we can afford to start with a bigger learning rate
+  learn_rate = 0.05,                                                         
+  
+  ## learning rate annealing: learning_rate shrinks by 1% after every tree 
+  ## (use 1.00 to disable, but then lower the learning_rate)
+  learn_rate_annealing = 0.99,                                               
+  
+  ## sample 80% of rows per tree
+  sample_rate = 0.8,                                                       
+
+  ## sample 80% of columns per split
+  col_sample_rate = 0.8, 
+## fix a random number generator seed for reproducibility
+  seed = 1234,                                                             
+  
+  ## early stopping once the validation AUC doesn't improve by at least 0.01% for 5 consecutive scoring events
+  stopping_rounds = 5,
+  stopping_tolerance = 1e-4,
+  stopping_metric = "logloss", 
+  
+  ## score every 10 trees to make early stopping reproducible (it depends on the scoring interval)
+  score_tree_interval = 10                                                
+)
+
+## by default, display the grid search results sorted by increasing logloss (since this is a classification task)
+grid                                                                       
+
+## sort the grid models by decreasing logloss
+sortedGrid <- h2o.getGrid("depth_grid", sort_by="logloss", decreasing = TRUE)    
+sortedGrid
+
+## find the range of max_depth for the top 5 models
+topDepths = sortedGrid@summary_table$max_depth[1:5]                       
+minDepth = min(as.numeric(topDepths))
+maxDepth = max(as.numeric(topDepths))
+minDepth
+maxDepth
+
+
+
+
+
+
+```
+
+
+Now that we know a good range for max_depth, we can tune all other parameters in more detail. Since we don't know what combinations of hyper-parameters will result in the best model, we'll use random hyper-parameter search to "let the machine get luckier than a best guess of any human".
+
+
+```{r}
+hyper_params = list( 
+  ## restrict the search to the range of max_depth established above
+  max_depth = seq(minDepth,maxDepth,1),                                      
+  
+  ## search a large space of row sampling rates per tree
+  sample_rate = seq(0.2,1,0.01),                                             
+  
+  ## search a large space of column sampling rates per split
+  col_sample_rate = seq(0.2,1,0.01),                                         
+  
+  ## search a large space of column sampling rates per tree
+  col_sample_rate_per_tree = seq(0.2,1,0.01),                                
+  
+  ## search a large space of how column sampling per split should change as a function of the depth of the split
+  col_sample_rate_change_per_level = seq(0.9,1.1,0.01),                      
+  
+  ## search a large space of the number of min rows in a terminal node
+  min_rows = 2^seq(0,log2(nrow(hex_train[1:1000,]))-1,1),                                 
+  
+  ## search a large space of the number of bins for split-finding for continuous and integer columns
+  nbins = 2^seq(4,10,1),                                                     
+  
+  ## search a large space of the number of bins for split-finding for categorical columns
+  nbins_cats = 2^seq(4,12,1),                                                
+  
+  ## search a few minimum required relative error improvement thresholds for a split to happen
+  min_split_improvement = c(0,1e-8,1e-6,1e-4),                               
+  
+  ## try all histogram types (QuantilesGlobal and RoundRobin are good for numeric columns with outliers)
+  histogram_type = c("UniformAdaptive","QuantilesGlobal","RoundRobin")       
+)
+
+search_criteria = list(
+  ## Random grid search
+  strategy = "RandomDiscrete",      
+  
+  ## limit the runtime to 60 minutes
+  max_runtime_secs = 3600,         
+  
+  ## build no more than 100 models
+  max_models = 100,                  
+  
+  ## random number generator seed to make sampling of parameter combinations reproducible
+  seed = 1234,                        
+  
+  ## early stopping once the leaderboard of the top 5 models is converged to 0.1% relative difference
+  stopping_rounds = 5,                
+  stopping_metric = "logloss",
+  stopping_tolerance = 1e-3
+)
+
+grid <- h2o.grid(
+  ## hyper parameters
+  hyper_params = hyper_params,
+  
+  ## hyper-parameter search configuration (see above)
+  search_criteria = search_criteria,
+  
+  ## which algorithm to run
+  algorithm = "gbm",
+  
+  ## identifier for the grid, to later retrieve it
+  grid_id = "final_grid", 
+  
+  ## standard model parameters
+  x = features, 
+  y = target, 
+  training_frame = hex_train[1:1000,], 
+  
+  ## more trees is better if the learning rate is small enough
+  ## use "more than enough" trees - we have early stopping
+  ntrees = 1000,                                                            
+  
+  ## smaller learning rate is better
+  ## since we have learning_rate_annealing, we can afford to start with a bigger learning rate
+  learn_rate = 0.05,                                                         
+  
+  ## learning rate annealing: learning_rate shrinks by 1% after every tree 
+  ## (use 1.00 to disable, but then lower the learning_rate)
+  learn_rate_annealing = 0.99,                                               
+  
+  ## early stopping based on timeout (no model should take more than 1 hour - modify as needed)
+  max_runtime_secs = 3600,                                                 
+  
+  ## early stopping once the validation AUC doesn't improve by at least 0.01% for 5 consecutive scoring events
+  stopping_rounds = 5, stopping_tolerance = 1e-4, stopping_metric = "logloss", 
+  
+  ## score every 10 trees to make early stopping reproducible (it depends on the scoring interval)
+  score_tree_interval = 10,                                                
+  
+  ## base random number generator seed for each model (automatically gets incremented internally for each model)
+  seed = 1234                                                             
+)
+
+## Sort the grid models by logloss
+sortedGrid <- h2o.getGrid("final_grid", sort_by = "logloss", decreasing = TRUE)    
+sortedGrid
+```
+
+
+
+
+
+
+
+
+
+
+
